@@ -1,20 +1,29 @@
 #target bridge
 
 /*
-Adobe Bridge 用: JPG フォルダのレーティングを同名 RAW ファイルへ同期します。
+Adobe Bridge 用: JPG / RAW フォルダ間で同名ファイルのレーティングを同期します。
 
 このファイルを Bridge の起動スクリプトとして配置すると、次のメニューを追加します。
 Tools > JPGのレーティングを同名RAWに同期
+Tools > RAWのレーティングを同名JPGに同期
 */
 
 var SYNC_JPG_RATING_TO_RAW_CONFIG = {
     menuId: "syncJpgRatingToRaw",
     menuLabel: "JPGのレーティングを同名RAWに同期",
+    reverseMenuId: "syncRawRatingToJpg",
+    reverseMenuLabel: "RAWのレーティングを同名JPGに同期",
     maxReportItems: 20,
+    parallelWorkers: 4,
+    workerBatchSize: 8,
     xmpNamespace: "http://ns.adobe.com/xap/1.0/"
 };
 
+var SYNC_JPG_RATING_TO_RAW_SESSIONS = {};
+var SYNC_JPG_RATING_TO_RAW_SESSION_ID = 0;
+
 // 対象拡張子を増やしたい場合は、このリストを編集してください。
+// 判定時に小文字化するため、ここは小文字で定義しておけば大文字拡張子にも一致します。
 var JPG_EXTENSIONS = [
     "jpg",
     "jpeg"
@@ -39,10 +48,28 @@ if (BridgeTalk.appName == "bridge") {
 }
 
 function installMenu() {
+    installCommand(
+        SYNC_JPG_RATING_TO_RAW_CONFIG.menuId,
+        SYNC_JPG_RATING_TO_RAW_CONFIG.menuLabel,
+        function () {
+            main(createSyncDirection("jpgToRaw"));
+        }
+    );
+
+    installCommand(
+        SYNC_JPG_RATING_TO_RAW_CONFIG.reverseMenuId,
+        SYNC_JPG_RATING_TO_RAW_CONFIG.reverseMenuLabel,
+        function () {
+            main(createSyncDirection("rawToJpg"));
+        }
+    );
+}
+
+function installCommand(menuId, menuLabel, onSelect) {
     var command = null;
 
     try {
-        command = MenuElement.find(SYNC_JPG_RATING_TO_RAW_CONFIG.menuId);
+        command = MenuElement.find(menuId);
     } catch (findError) {
         command = null;
     }
@@ -50,66 +77,89 @@ function installMenu() {
     if (command == null) {
         command = MenuElement.create(
             "command",
-            SYNC_JPG_RATING_TO_RAW_CONFIG.menuLabel,
+            menuLabel,
             "at the end of Tools",
-            SYNC_JPG_RATING_TO_RAW_CONFIG.menuId
+            menuId
         );
     }
 
-    command.onSelect = function () {
-        main();
+    command.onSelect = onSelect;
+}
+
+function createSyncDirection(directionName) {
+    if (directionName == "rawToJpg") {
+        return {
+            completionLabel: "RAWからJPGへのレーティング同期",
+            sourceLabel: "RAW",
+            targetLabel: "JPG",
+            sourceExtensions: RAW_EXTENSIONS,
+            targetExtensions: JPG_EXTENSIONS,
+            sourcePrompt: "レーティング元の RAW フォルダを選択してください。",
+            targetPrompt: "レーティング反映先の JPG フォルダを選択してください。"
+        };
+    }
+
+    return {
+        completionLabel: "JPGからRAWへのレーティング同期",
+        sourceLabel: "JPG",
+        targetLabel: "RAW",
+        sourceExtensions: JPG_EXTENSIONS,
+        targetExtensions: RAW_EXTENSIONS,
+        sourcePrompt: "レーティング元の JPG フォルダを選択してください。",
+        targetPrompt: "レーティング反映先の RAW フォルダを選択してください。"
     };
 }
 
-function main() {
+function main(direction) {
     if (BridgeTalk.appName != "bridge") {
         alert("このスクリプトは Adobe Bridge で実行してください。");
         return;
     }
 
-    var jpgFolder = selectJpgFolder();
-    if (jpgFolder == null) {
-        alert("JPGフォルダの選択がキャンセルされたため、処理を中止しました。");
+    var sourceFolder = selectSourceFolder(direction);
+    if (sourceFolder == null) {
+        alert(direction.sourceLabel + "フォルダの選択がキャンセルされたため、処理を中止しました。");
         return;
     }
 
-    var rawFolder = selectRawFolder(jpgFolder);
-    if (rawFolder == null) {
-        alert("RAWフォルダの選択がキャンセルされたため、処理を中止しました。");
+    var targetFolder = selectTargetFolder(direction, sourceFolder);
+    if (targetFolder == null) {
+        alert(direction.targetLabel + "フォルダの選択がキャンセルされたため、処理を中止しました。");
         return;
     }
 
     try {
-        var jpgFiles = getJpgFiles(jpgFolder);
-        var rawIndex = buildRawIndex(rawFolder);
-        var result = syncRatings(jpgFiles, rawIndex);
+        var sourceFiles = getFilesByExtensions(sourceFolder, direction.sourceExtensions);
+        var targetIndex = buildFileIndex(targetFolder, direction.targetExtensions);
 
-        result.jpgFolder = jpgFolder;
-        result.rawFolder = rawFolder;
-        showResult(result);
+        syncRatings(sourceFiles, targetIndex, direction, function (result) {
+            result.sourceFolder = sourceFolder;
+            result.targetFolder = targetFolder;
+            showResult(result);
+        });
     } catch (error) {
         alert("処理を続行できないエラーが発生しました。\n\n" + getErrorMessage(error));
     }
 }
 
-function selectJpgFolder() {
-    return selectFolder("レーティング元の JPG フォルダを選択してください。", getCurrentBridgeFolder());
+function selectSourceFolder(direction) {
+    return selectFolder(direction.sourcePrompt, getCurrentBridgeFolder());
 }
 
-function selectRawFolder(jpgFolder) {
+function selectTargetFolder(direction, sourceFolder) {
     var startFolder = getCurrentBridgeFolder();
 
     if (startFolder == null) {
         try {
-            if (jpgFolder != null && jpgFolder.parent != null) {
-                startFolder = jpgFolder.parent;
+            if (sourceFolder != null && sourceFolder.parent != null) {
+                startFolder = sourceFolder.parent;
             }
         } catch (error) {
             startFolder = null;
         }
     }
 
-    return selectFolder("レーティング反映先の RAW フォルダを選択してください。", startFolder);
+    return selectFolder(direction.targetPrompt, startFolder);
 }
 
 function getCurrentBridgeFolder() {
@@ -238,9 +288,9 @@ function selectFolder(prompt, startFolder) {
     return null;
 }
 
-function getJpgFiles(folder) {
+function getFilesByExtensions(folder, extensions) {
     var files = folder.getFiles(function (item) {
-        return item instanceof File && isExtensionAllowed(getExtension(item.name), JPG_EXTENSIONS);
+        return item instanceof File && isExtensionAllowed(getExtension(item.name), extensions);
     });
 
     if (files == null) {
@@ -250,30 +300,30 @@ function getJpgFiles(folder) {
     return sortFilesByName(files);
 }
 
-function buildRawIndex(rawFolder) {
-    var rawFiles = rawFolder.getFiles(function (item) {
-        return item instanceof File && isExtensionAllowed(getExtension(item.name), RAW_EXTENSIONS);
+function buildFileIndex(folder, extensions) {
+    var files = folder.getFiles(function (item) {
+        return item instanceof File && isExtensionAllowed(getExtension(item.name), extensions);
     });
     var index = {};
     var i;
-    var rawFile;
+    var file;
     var key;
 
-    if (rawFiles == null) {
+    if (files == null) {
         return index;
     }
 
-    rawFiles = sortFilesByName(rawFiles);
+    files = sortFilesByName(files);
 
-    for (i = 0; i < rawFiles.length; i++) {
-        rawFile = rawFiles[i];
-        key = getIndexKey(rawFile.name);
+    for (i = 0; i < files.length; i++) {
+        file = files[i];
+        key = getIndexKey(file.name);
 
         if (!index[key]) {
             index[key] = [];
         }
 
-        index[key].push(rawFile);
+        index[key].push(file);
     }
 
     return index;
@@ -299,86 +349,182 @@ function getExtension(fileName) {
     return fileName.substring(dotIndex + 1).toLowerCase();
 }
 
-function syncRatings(jpgFiles, rawIndex) {
-    var result = createResult(jpgFiles.length);
-    var i;
-    var jpgFile;
-    var key;
-    var rawCandidates;
-    var rawFile;
-    var rating;
+function syncRatings(sourceFiles, targetIndex, direction, onComplete) {
+    var result = createResult(sourceFiles.length, direction);
+    var session;
+    var sessionId;
 
-    for (i = 0; i < jpgFiles.length; i++) {
-        jpgFile = jpgFiles[i];
-        key = getIndexKey(jpgFile.name);
-        rawCandidates = rawIndex[key];
-
-        if (rawCandidates == null || rawCandidates.length == 0) {
-            result.notFoundCount++;
-            addReportItem(result.notFoundFiles, getDisplayName(jpgFile));
-            continue;
-        }
-
-        if (rawCandidates.length > 1) {
-            result.multipleCount++;
-            addReportItem(
-                result.multipleFiles,
-                getDisplayName(jpgFile) + " -> " + joinFileNames(rawCandidates)
-            );
-            continue;
-        }
-
-        rawFile = rawCandidates[0];
-
-        try {
-            rating = getThumbnailRating(new Thumbnail(jpgFile));
-            setThumbnailRating(new Thumbnail(rawFile), rating);
-            result.successCount++;
-        } catch (error) {
-            result.errorCount++;
-            addReportItem(
-                result.errorFiles,
-                getDisplayName(jpgFile) + " -> " + getDisplayName(rawFile) + ": " + getErrorMessage(error)
-            );
-        }
+    if (!canScheduleTasks()) {
+        syncRatingsSynchronously(sourceFiles, targetIndex, result);
+        onComplete(result);
+        return;
     }
 
-    return result;
+    sessionId = "ratingSync" + (++SYNC_JPG_RATING_TO_RAW_SESSION_ID);
+    session = {
+        id: sessionId,
+        cursor: 0,
+        activeWorkers: 0,
+        sourceFiles: sourceFiles,
+        targetIndex: targetIndex,
+        result: result,
+        onComplete: onComplete
+    };
+    SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId] = session;
+    startRatingSyncWorkers(session);
+}
+
+function canScheduleTasks() {
+    return typeof app != "undefined" && app != null && typeof app.scheduleTask == "function";
+}
+
+function startRatingSyncWorkers(session) {
+    var workerCount = Math.min(SYNC_JPG_RATING_TO_RAW_CONFIG.parallelWorkers, session.sourceFiles.length);
+    var i;
+
+    if (workerCount <= 0) {
+        finishRatingSyncSession(session);
+        return;
+    }
+
+    for (i = 0; i < workerCount; i++) {
+        session.activeWorkers++;
+        scheduleRatingSyncWorker(session.id);
+    }
+}
+
+function scheduleRatingSyncWorker(sessionId) {
+    app.scheduleTask("processRatingSyncWorker('" + sessionId + "')", 1, false);
+}
+
+function processRatingSyncWorker(sessionId) {
+    var session = SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId];
+    var processedCount = 0;
+    var sourceFile;
+
+    if (session == null) {
+        return;
+    }
+
+    while (session.cursor < session.sourceFiles.length && processedCount < SYNC_JPG_RATING_TO_RAW_CONFIG.workerBatchSize) {
+        sourceFile = session.sourceFiles[session.cursor];
+        session.cursor++;
+        processedCount++;
+        processRatingSyncFile(sourceFile, session.targetIndex, session.result);
+    }
+
+    if (session.cursor < session.sourceFiles.length) {
+        scheduleRatingSyncWorker(session.id);
+        return;
+    }
+
+    session.activeWorkers--;
+
+    if (session.activeWorkers <= 0) {
+        finishRatingSyncSession(session);
+    }
+}
+
+function finishRatingSyncSession(session) {
+    var onComplete = session.onComplete;
+
+    delete SYNC_JPG_RATING_TO_RAW_SESSIONS[session.id];
+    onComplete(session.result);
+}
+
+function syncRatingsSynchronously(sourceFiles, targetIndex, result) {
+    var i;
+
+    for (i = 0; i < sourceFiles.length; i++) {
+        processRatingSyncFile(sourceFiles[i], targetIndex, result);
+    }
+}
+
+function processRatingSyncFile(sourceFile, targetIndex, result) {
+    var key;
+    var targetCandidates;
+    var targetFile;
+    var sourceRating;
+    var targetRating;
+
+    key = getIndexKey(sourceFile.name);
+    targetCandidates = targetIndex[key];
+
+    if (targetCandidates == null || targetCandidates.length == 0) {
+        result.notFoundCount++;
+        addReportItem(result.notFoundFiles, getDisplayName(sourceFile));
+        return;
+    }
+
+    if (targetCandidates.length > 1) {
+        result.multipleCount++;
+        addReportItem(
+            result.multipleFiles,
+            getDisplayName(sourceFile) + " -> " + joinFileNames(targetCandidates)
+        );
+        return;
+    }
+
+    targetFile = targetCandidates[0];
+
+    try {
+        sourceRating = getThumbnailRating(new Thumbnail(sourceFile));
+        targetRating = getThumbnailRating(new Thumbnail(targetFile));
+
+        if (sourceRating == targetRating) {
+            result.skippedSameRatingCount++;
+            return;
+        }
+
+        setThumbnailRating(new Thumbnail(targetFile), sourceRating);
+        result.updatedCount++;
+    } catch (error) {
+        result.errorCount++;
+        addReportItem(
+            result.errorFiles,
+            getDisplayName(sourceFile) + " -> " + getDisplayName(targetFile) + ": " + getErrorMessage(error)
+        );
+    }
 }
 
 function showResult(result) {
     var lines = [];
 
-    lines.push("JPGのレーティング同期が完了しました。");
+    lines.push(result.completionLabel + "が完了しました。");
     lines.push("");
-    lines.push("JPGフォルダ: " + getFolderName(result.jpgFolder));
-    lines.push("RAWフォルダ: " + getFolderName(result.rawFolder));
+    lines.push("同期元 " + result.sourceLabel + " フォルダ: " + getFolderName(result.sourceFolder));
+    lines.push("同期先 " + result.targetLabel + " フォルダ: " + getFolderName(result.targetFolder));
     lines.push("");
-    lines.push("JPG対象ファイル数: " + result.jpgCount);
-    lines.push("同期成功数: " + result.successCount);
-    lines.push("RAWが見つからなかった件数: " + result.notFoundCount);
-    lines.push("複数RAW候補のためスキップした件数: " + result.multipleCount);
+    lines.push(result.sourceLabel + "対象ファイル数: " + result.sourceCount);
+    lines.push("更新件数: " + result.updatedCount);
+    lines.push("同一レーティングのため更新しなかった件数: " + result.skippedSameRatingCount);
+    lines.push(result.targetLabel + "が見つからなかった件数: " + result.notFoundCount);
+    lines.push("複数" + result.targetLabel + "候補のためスキップした件数: " + result.multipleCount);
     lines.push("エラー件数: " + result.errorCount);
 
-    appendReportSection(lines, "RAWが見つからなかったファイル", result.notFoundFiles, result.notFoundCount);
-    appendReportSection(lines, "複数RAW候補のためスキップしたファイル", result.multipleFiles, result.multipleCount);
+    appendReportSection(lines, result.targetLabel + "が見つからなかったファイル", result.notFoundFiles, result.notFoundCount);
+    appendReportSection(lines, "複数" + result.targetLabel + "候補のためスキップしたファイル", result.multipleFiles, result.multipleCount);
     appendReportSection(lines, "エラーが発生したファイル", result.errorFiles, result.errorCount);
 
     alert(lines.join("\n"));
 }
 
-function createResult(jpgCount) {
+function createResult(sourceCount, direction) {
     return {
-        jpgCount: jpgCount,
-        successCount: 0,
+        completionLabel: direction.completionLabel,
+        sourceLabel: direction.sourceLabel,
+        targetLabel: direction.targetLabel,
+        sourceCount: sourceCount,
+        updatedCount: 0,
+        skippedSameRatingCount: 0,
         notFoundCount: 0,
         multipleCount: 0,
         errorCount: 0,
         notFoundFiles: [],
         multipleFiles: [],
         errorFiles: [],
-        jpgFolder: null,
-        rawFolder: null
+        sourceFolder: null,
+        targetFolder: null
     };
 }
 
@@ -428,7 +574,7 @@ function getThumbnailMetadataRating(thumbnail) {
 }
 
 function setThumbnailRating(thumbnail, rating) {
-    // rating が 0 の場合も必ず代入します。0 は「未評価」であり同期対象です。
+    // rating が 0 の場合も代入します。0 は「未評価」であり同期対象です。
     thumbnail.rating = rating;
 }
 
