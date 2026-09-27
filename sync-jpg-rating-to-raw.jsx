@@ -14,13 +14,13 @@ var SYNC_JPG_RATING_TO_RAW_CONFIG = {
     reverseMenuId: "syncRawRatingToJpg",
     reverseMenuLabel: "RAWのレーティングを同名JPGに同期",
     maxReportItems: 20,
-    parallelWorkers: 4,
-    workerBatchSize: 8,
+    batchSize: 8,
     xmpNamespace: "http://ns.adobe.com/xap/1.0/"
 };
 
 var SYNC_JPG_RATING_TO_RAW_SESSIONS = {};
 var SYNC_JPG_RATING_TO_RAW_SESSION_ID = 0;
+var SYNC_JPG_RATING_TO_RAW_RUNNING = false;
 
 // 対象拡張子を増やしたい場合は、このリストを編集してください。
 // 判定時に小文字化するため、ここは小文字で定義しておけば大文字拡張子にも一致します。
@@ -116,29 +116,43 @@ function main(direction) {
         return;
     }
 
-    var sourceFolder = selectSourceFolder(direction);
-    if (sourceFolder == null) {
-        alert(direction.sourceLabel + "フォルダの選択がキャンセルされたため、処理を中止しました。");
+    if (SYNC_JPG_RATING_TO_RAW_RUNNING) {
+        alert("レーティング同期は実行中です。完了後に再実行してください。");
         return;
     }
 
-    var targetFolder = selectTargetFolder(direction, sourceFolder);
-    if (targetFolder == null) {
-        alert(direction.targetLabel + "フォルダの選択がキャンセルされたため、処理を中止しました。");
-        return;
-    }
+    SYNC_JPG_RATING_TO_RAW_RUNNING = true;
+    var handedOff = false;
 
     try {
+        var sourceFolder = selectSourceFolder(direction);
+        if (sourceFolder == null) {
+            alert(direction.sourceLabel + "フォルダの選択がキャンセルされたため、処理を中止しました。");
+            return;
+        }
+
+        var targetFolder = selectTargetFolder(direction, sourceFolder);
+        if (targetFolder == null) {
+            alert(direction.targetLabel + "フォルダの選択がキャンセルされたため、処理を中止しました。");
+            return;
+        }
+
         var sourceFiles = getFilesByExtensions(sourceFolder, direction.sourceExtensions);
         var targetIndex = buildFileIndex(targetFolder, direction.targetExtensions);
 
         syncRatings(sourceFiles, targetIndex, direction, function (result) {
+            SYNC_JPG_RATING_TO_RAW_RUNNING = false;
             result.sourceFolder = sourceFolder;
             result.targetFolder = targetFolder;
             showResult(result);
         });
+        handedOff = true;
     } catch (error) {
         alert("処理を続行できないエラーが発生しました。\n\n" + getErrorMessage(error));
+    } finally {
+        if (!handedOff) {
+            SYNC_JPG_RATING_TO_RAW_RUNNING = false;
+        }
     }
 }
 
@@ -313,8 +327,6 @@ function buildFileIndex(folder, extensions) {
         return index;
     }
 
-    files = sortFilesByName(files);
-
     for (i = 0; i < files.length; i++) {
         file = files[i];
         key = getIndexKey(file.name);
@@ -364,64 +376,57 @@ function syncRatings(sourceFiles, targetIndex, direction, onComplete) {
     session = {
         id: sessionId,
         cursor: 0,
-        activeWorkers: 0,
         sourceFiles: sourceFiles,
         targetIndex: targetIndex,
         result: result,
         onComplete: onComplete
     };
     SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId] = session;
-    startRatingSyncWorkers(session);
+    try {
+        if (sourceFiles.length == 0) {
+            finishRatingSyncSession(session);
+        } else {
+            scheduleRatingSyncBatch(session.id);
+        }
+    } catch (error) {
+        delete SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId];
+        throw error;
+    }
 }
 
 function canScheduleTasks() {
     return typeof app != "undefined" && app != null && typeof app.scheduleTask == "function";
 }
 
-function startRatingSyncWorkers(session) {
-    var workerCount = Math.min(SYNC_JPG_RATING_TO_RAW_CONFIG.parallelWorkers, session.sourceFiles.length);
-    var i;
-
-    if (workerCount <= 0) {
-        finishRatingSyncSession(session);
-        return;
-    }
-
-    for (i = 0; i < workerCount; i++) {
-        session.activeWorkers++;
-        scheduleRatingSyncWorker(session.id);
-    }
+function scheduleRatingSyncBatch(sessionId) {
+    app.scheduleTask("processRatingSyncBatch('" + sessionId + "')", 1, false);
 }
 
-function scheduleRatingSyncWorker(sessionId) {
-    app.scheduleTask("processRatingSyncWorker('" + sessionId + "')", 1, false);
-}
-
-function processRatingSyncWorker(sessionId) {
+function processRatingSyncBatch(sessionId) {
     var session = SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId];
     var processedCount = 0;
-    var sourceFile;
 
     if (session == null) {
         return;
     }
 
-    while (session.cursor < session.sourceFiles.length && processedCount < SYNC_JPG_RATING_TO_RAW_CONFIG.workerBatchSize) {
-        sourceFile = session.sourceFiles[session.cursor];
-        session.cursor++;
-        processedCount++;
-        processRatingSyncFile(sourceFile, session.targetIndex, session.result);
-    }
+    try {
+        while (session.cursor < session.sourceFiles.length && processedCount < SYNC_JPG_RATING_TO_RAW_CONFIG.batchSize) {
+            processRatingSyncFile(session.sourceFiles[session.cursor], session.targetIndex, session.result);
+            session.cursor++;
+            processedCount++;
+        }
 
-    if (session.cursor < session.sourceFiles.length) {
-        scheduleRatingSyncWorker(session.id);
-        return;
-    }
-
-    session.activeWorkers--;
-
-    if (session.activeWorkers <= 0) {
-        finishRatingSyncSession(session);
+        // 次の予約はこのバッチの処理が終わってから1件だけ行います。
+        if (session.cursor < session.sourceFiles.length) {
+            scheduleRatingSyncBatch(session.id);
+        } else {
+            finishRatingSyncSession(session);
+        }
+    } catch (error) {
+        delete SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId];
+        SYNC_JPG_RATING_TO_RAW_RUNNING = false;
+        alert("レーティング同期を中断しました。処理済みの更新は保持されます。\n\n" + getErrorMessage(error));
     }
 }
 
@@ -446,22 +451,27 @@ function processRatingSyncFile(sourceFile, targetIndex, result) {
     var targetFile;
     var sourceRating;
     var targetRating;
+    var targetThumbnail;
 
     key = getIndexKey(sourceFile.name);
     targetCandidates = targetIndex[key];
 
     if (targetCandidates == null || targetCandidates.length == 0) {
         result.notFoundCount++;
-        addReportItem(result.notFoundFiles, getDisplayName(sourceFile));
+        if (result.notFoundFiles.length < SYNC_JPG_RATING_TO_RAW_CONFIG.maxReportItems) {
+            addReportItem(result.notFoundFiles, getDisplayName(sourceFile));
+        }
         return;
     }
 
     if (targetCandidates.length > 1) {
         result.multipleCount++;
-        addReportItem(
-            result.multipleFiles,
-            getDisplayName(sourceFile) + " -> " + joinFileNames(targetCandidates)
-        );
+        if (result.multipleFiles.length < SYNC_JPG_RATING_TO_RAW_CONFIG.maxReportItems) {
+            addReportItem(
+                result.multipleFiles,
+                getDisplayName(sourceFile) + " -> " + joinFileNames(sortFilesByName(targetCandidates))
+            );
+        }
         return;
     }
 
@@ -469,21 +479,24 @@ function processRatingSyncFile(sourceFile, targetIndex, result) {
 
     try {
         sourceRating = getThumbnailRating(new Thumbnail(sourceFile));
-        targetRating = getThumbnailRating(new Thumbnail(targetFile));
+        targetThumbnail = new Thumbnail(targetFile);
+        targetRating = getThumbnailRating(targetThumbnail);
 
         if (sourceRating == targetRating) {
             result.skippedSameRatingCount++;
             return;
         }
 
-        setThumbnailRating(new Thumbnail(targetFile), sourceRating);
+        setThumbnailRating(targetThumbnail, sourceRating);
         result.updatedCount++;
     } catch (error) {
         result.errorCount++;
-        addReportItem(
-            result.errorFiles,
-            getDisplayName(sourceFile) + " -> " + getDisplayName(targetFile) + ": " + getErrorMessage(error)
-        );
+        if (result.errorFiles.length < SYNC_JPG_RATING_TO_RAW_CONFIG.maxReportItems) {
+            addReportItem(
+                result.errorFiles,
+                getDisplayName(sourceFile) + " -> " + getDisplayName(targetFile) + ": " + getErrorMessage(error)
+            );
+        }
     }
 }
 
@@ -557,20 +570,15 @@ function getThumbnailRating(thumbnail) {
 }
 
 function getThumbnailMetadataRating(thumbnail) {
-    var metadata;
+    // 読み取り失敗を未評価と扱うと、同期先の評価を誤って消してしまいます。
+    var metadata = thumbnail.synchronousMetadata;
 
-    try {
-        metadata = thumbnail.synchronousMetadata;
-
-        if (metadata == null) {
-            return 0;
-        }
-
-        metadata.namespace = SYNC_JPG_RATING_TO_RAW_CONFIG.xmpNamespace;
-        return metadata.Rating;
-    } catch (error) {
-        return 0;
+    if (metadata == null) {
+        throw new Error("レーティングのメタデータを取得できませんでした。");
     }
+
+    metadata.namespace = SYNC_JPG_RATING_TO_RAW_CONFIG.xmpNamespace;
+    return metadata.Rating;
 }
 
 function setThumbnailRating(thumbnail, rating) {
@@ -622,20 +630,27 @@ function appendReportSection(lines, title, items, totalCount) {
 }
 
 function sortFilesByName(files) {
-    files.sort(function (left, right) {
-        var leftName = getDisplayName(left).toLowerCase();
-        var rightName = getDisplayName(right).toLowerCase();
+    var entries = [];
+    var i;
 
-        if (leftName < rightName) {
+    // 比較のたびに URI デコードと小文字化を繰り返さないようにします。
+    for (i = 0; i < files.length; i++) {
+        entries.push({ file: files[i], name: getDisplayName(files[i]).toLowerCase(), order: i });
+    }
+
+    entries.sort(function (left, right) {
+        if (left.name < right.name) {
             return -1;
         }
-
-        if (leftName > rightName) {
+        if (left.name > right.name) {
             return 1;
         }
-
-        return 0;
+        return left.order - right.order;
     });
+
+    for (i = 0; i < entries.length; i++) {
+        files[i] = entries[i].file;
+    }
 
     return files;
 }
