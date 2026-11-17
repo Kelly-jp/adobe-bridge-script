@@ -14,7 +14,8 @@ var SYNC_JPG_RATING_TO_RAW_CONFIG = {
     reverseMenuId: "syncRawRatingToJpg",
     reverseMenuLabel: "RAWのレーティングを同名JPGに同期",
     maxReportItems: 20,
-    batchSize: 8,
+    batchSize: 4,
+    batchDelayMs: 100,
     xmpNamespace: "http://ns.adobe.com/xap/1.0/"
 };
 
@@ -141,6 +142,8 @@ function main(direction) {
         var targetIndex = buildFileIndex(targetFolder, direction.targetExtensions);
 
         syncRatings(sourceFiles, targetIndex, direction, function (result) {
+            sourceFiles = null;
+            targetIndex = null;
             SYNC_JPG_RATING_TO_RAW_RUNNING = false;
             result.sourceFolder = sourceFolder;
             result.targetFolder = targetFolder;
@@ -368,6 +371,9 @@ function syncRatings(sourceFiles, targetIndex, direction, onComplete) {
 
     if (!canScheduleTasks()) {
         syncRatingsSynchronously(sourceFiles, targetIndex, result);
+        sourceFiles = null;
+        targetIndex = null;
+        collectRatingSyncGarbage();
         onComplete(result);
         return;
     }
@@ -389,7 +395,7 @@ function syncRatings(sourceFiles, targetIndex, direction, onComplete) {
             scheduleRatingSyncBatch(session.id);
         }
     } catch (error) {
-        delete SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId];
+        releaseRatingSyncSession(session);
         throw error;
     }
 }
@@ -399,7 +405,7 @@ function canScheduleTasks() {
 }
 
 function scheduleRatingSyncBatch(sessionId) {
-    app.scheduleTask("processRatingSyncBatch('" + sessionId + "')", 1, false);
+    app.scheduleTask("processRatingSyncBatch('" + sessionId + "')", SYNC_JPG_RATING_TO_RAW_CONFIG.batchDelayMs, false);
 }
 
 function processRatingSyncBatch(sessionId) {
@@ -413,18 +419,22 @@ function processRatingSyncBatch(sessionId) {
     try {
         while (session.cursor < session.sourceFiles.length && processedCount < SYNC_JPG_RATING_TO_RAW_CONFIG.batchSize) {
             processRatingSyncFile(session.sourceFiles[session.cursor], session.targetIndex, session.result);
+            session.sourceFiles[session.cursor] = null;
             session.cursor++;
             processedCount++;
         }
 
-        // 次の予約はこのバッチの処理が終わってから1件だけ行います。
+        // ファイル処理のスタックが戻ってから、ネイティブオブジェクトの回収を促します。
+        collectRatingSyncGarbage();
+
+        // Bridge が更新を処理する時間を挟み、次の予約は1件だけ行います。
         if (session.cursor < session.sourceFiles.length) {
             scheduleRatingSyncBatch(session.id);
         } else {
             finishRatingSyncSession(session);
         }
     } catch (error) {
-        delete SYNC_JPG_RATING_TO_RAW_SESSIONS[sessionId];
+        releaseRatingSyncSession(session);
         SYNC_JPG_RATING_TO_RAW_RUNNING = false;
         alert("レーティング同期を中断しました。処理済みの更新は保持されます。\n\n" + getErrorMessage(error));
     }
@@ -432,9 +442,25 @@ function processRatingSyncBatch(sessionId) {
 
 function finishRatingSyncSession(session) {
     var onComplete = session.onComplete;
+    var result = session.result;
 
+    releaseRatingSyncSession(session);
+    collectRatingSyncGarbage();
+    onComplete(result);
+}
+
+function releaseRatingSyncSession(session) {
     delete SYNC_JPG_RATING_TO_RAW_SESSIONS[session.id];
-    onComplete(session.result);
+    session.sourceFiles = null;
+    session.targetIndex = null;
+    session.onComplete = null;
+    session.result = null;
+}
+
+function collectRatingSyncGarbage() {
+    if (typeof $ != "undefined" && typeof $.gc == "function") {
+        $.gc();
+    }
 }
 
 function syncRatingsSynchronously(sourceFiles, targetIndex, result) {
@@ -442,7 +468,12 @@ function syncRatingsSynchronously(sourceFiles, targetIndex, result) {
 
     for (i = 0; i < sourceFiles.length; i++) {
         processRatingSyncFile(sourceFiles[i], targetIndex, result);
+        sourceFiles[i] = null;
+        if ((i + 1) % SYNC_JPG_RATING_TO_RAW_CONFIG.batchSize == 0) {
+            collectRatingSyncGarbage();
+        }
     }
+    collectRatingSyncGarbage();
 }
 
 function processRatingSyncFile(sourceFile, targetIndex, result) {
@@ -451,6 +482,7 @@ function processRatingSyncFile(sourceFile, targetIndex, result) {
     var targetFile;
     var sourceRating;
     var targetRating;
+    var sourceThumbnail;
     var targetThumbnail;
 
     key = getIndexKey(sourceFile.name);
@@ -478,7 +510,9 @@ function processRatingSyncFile(sourceFile, targetIndex, result) {
     targetFile = targetCandidates[0];
 
     try {
-        sourceRating = getThumbnailRating(new Thumbnail(sourceFile));
+        sourceThumbnail = new Thumbnail(sourceFile);
+        sourceRating = getThumbnailRating(sourceThumbnail);
+        sourceThumbnail = null;
         targetThumbnail = new Thumbnail(targetFile);
         targetRating = getThumbnailRating(targetThumbnail);
 
@@ -497,6 +531,10 @@ function processRatingSyncFile(sourceFile, targetIndex, result) {
                 getDisplayName(sourceFile) + " -> " + getDisplayName(targetFile) + ": " + getErrorMessage(error)
             );
         }
+    } finally {
+        // rating の取得・更新に失敗した場合も Thumbnail を保持しません。
+        sourceThumbnail = null;
+        targetThumbnail = null;
     }
 }
 

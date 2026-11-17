@@ -85,10 +85,66 @@ test('rescheduling failure keeps completed writes and permits retry', () => {
     h.run(source, target);
     h.context.app.scheduleTask = () => { throw new Error('schedule failed'); };
     h.drain();
-    assert.equal(h.writes.length, 8);
+    assert.equal(h.writes.length, h.context.SYNC_JPG_RATING_TO_RAW_CONFIG.batchSize);
     assert.match(h.alerts.at(-1), /中断/);
     assert.equal(h.context.SYNC_JPG_RATING_TO_RAW_RUNNING, false);
     assert.equal(Object.keys(h.context.SYNC_JPG_RATING_TO_RAW_SESSIONS).length, 0);
+});
+
+test('batches yield, collect garbage and release processed source references', () => {
+    const h = setup();
+    const delays = [];
+    let collections = 0;
+    h.context.$ = { gc() { collections++; } };
+    h.context.app.scheduleTask = (body, delay, repeat) => {
+        delays.push(delay);
+        assert.equal(repeat, false);
+        h.queue.push(body);
+    };
+    const source = Array.from({ length: 1001 }, (_, i) => new h.File(`${i}.jpg`, 3));
+    h.run(source, source.map((_, i) => new h.File(`${i}.raf`, 0)));
+    const session = Object.values(h.context.SYNC_JPG_RATING_TO_RAW_SESSIONS)[0];
+    vm.runInContext(h.queue.shift(), h.context);
+    assert.equal(h.writes.length, 4);
+    assert.equal(collections, 1);
+    assert.ok(session.sourceFiles.slice(0, session.cursor).every(file => file === null));
+    assert.ok(session.sourceFiles[session.cursor] instanceof h.File);
+    let completed = false;
+    const originalComplete = session.onComplete;
+    session.onComplete = result => {
+        for (const key of ['sourceFiles', 'targetIndex', 'onComplete', 'result']) assert.equal(session[key], null);
+        completed = true;
+        originalComplete(result);
+    };
+    h.drain();
+    assert.equal(completed, true);
+    assert.equal(h.writes.length, 1001);
+    assert.equal(delays.length, 251);
+    assert.ok(delays.every(delay => delay >= 100));
+    assert.equal(collections, 252);
+});
+
+test('synchronous execution collects garbage with per-file failures', () => {
+    const h = setup(false);
+    let collections = 0;
+    h.context.$ = { gc() { collections++; } };
+    const source = Array.from({ length: 9 }, (_, i) => new h.File(`${i}.jpg`, 5));
+    source[0].readError = true;
+    h.run(source, source.map((_, i) => new h.File(`${i}.raf`, 0)));
+    assert.equal(h.writes.length, 8);
+    assert.equal(collections, 4);
+    assert.match(h.alerts.at(-1), /エラー件数: 1/);
+});
+
+test('interrupted batches release session references', () => {
+    const h = setup();
+    const source = Array.from({ length: 5 }, (_, i) => new h.File(`${i}.jpg`, 5));
+    h.run(source, source.map((_, i) => new h.File(`${i}.raf`, 0)));
+    const session = Object.values(h.context.SYNC_JPG_RATING_TO_RAW_SESSIONS)[0];
+    h.context.app.scheduleTask = () => { throw new Error('schedule failed'); };
+    h.drain();
+    for (const key of ['sourceFiles', 'targetIndex', 'onComplete', 'result']) assert.equal(session[key], null);
+    assert.match(h.alerts.at(-1), /schedule failed/);
 });
 
 test('empty input completes without scheduling', () => {
